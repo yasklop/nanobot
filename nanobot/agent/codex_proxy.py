@@ -116,17 +116,10 @@ class CodexProxy:
 
     async def send(self, message: str) -> str:
         """Send *message* to Codex and return its response text."""
-        # Send the message via send-keys -l (literal) + Enter.
-        await _run(
-            f'tmux -S {_q(self.socket)} send-keys -t {_q(self.tmux_session)} -l -- '
-            f'{_q(message)}'
-        )
-        await _run(
-            f'tmux -S {_q(self.socket)} send-keys -t {_q(self.tmux_session)} Enter'
-        )
+        await self._send_keys(message)
 
         # Wait for Codex to finish (prompt reappears) or ask a question.
-        stop_reason = await self._wait_for_input(timeout=120)
+        stop_reason = await self._wait_for_input(timeout=300)
 
         # Capture full pane and strip ANSI codes.
         full = await self._capture_pane()
@@ -164,6 +157,20 @@ class CodexProxy:
 
         cleaned = "\n".join(response_lines).strip()
         return cleaned or "(no output)"
+
+    async def send_nowait(self, message: str) -> None:
+        """Send *message* to Codex without waiting for a response (fire-and-forget)."""
+        await self._send_keys(message)
+
+    async def _send_keys(self, message: str) -> None:
+        """Type *message* into the tmux pane and press Enter."""
+        await _run(
+            f'tmux -S {_q(self.socket)} send-keys -t {_q(self.tmux_session)} -l -- '
+            f'{_q(message)}'
+        )
+        await _run(
+            f'tmux -S {_q(self.socket)} send-keys -t {_q(self.tmux_session)} Enter'
+        )
 
     async def is_alive(self) -> bool:
         """Check whether the tmux session is still running."""
@@ -373,9 +380,9 @@ async def watch_until_idle(
         await bus.publish_outbound(OutboundMessage(
             channel=channel, chat_id=chat_id,
             content=(
-                f"✅ Codex `{proxy.tmux_session}` 完成了\n\n"
+                f"✅ Codex `{proxy.tmux_session}` finished\n\n"
                 f"{summary}\n\n"
-                f"用 `/codex resume {proxy.tmux_session}` 繼續。"
+                f"Use `/codex resume {proxy.tmux_session}` to continue."
             ),
         ))
 
