@@ -100,6 +100,7 @@ class TestHandleStop:
         assert "2 task" in out.content
 
 
+
 class TestDispatch:
     def test_exec_tool_not_registered_when_disabled(self):
         from nanobot.config.schema import ExecToolConfig

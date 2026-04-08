@@ -7,6 +7,7 @@ import os
 import sys
 
 from nanobot import __version__
+from nanobot.agent.codex_proxy import CodexProxy, watch_until_idle
 from nanobot.bus.events import OutboundMessage
 from nanobot.command.router import CommandContext, CommandRouter
 from nanobot.utils.helpers import build_status_content
@@ -313,6 +314,320 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+# ------------------------------------------------------------------
+# /codex — Codex CLI proxy mode
+# ------------------------------------------------------------------
+
+async def cmd_codex(ctx: CommandContext) -> OutboundMessage:
+    """Manage Codex CLI proxy sessions.
+
+    /codex               — start Codex mode (workspace = bot workspace)
+    /codex start [path]  — start with explicit workspace
+    /codex exit          — detach from Codex mode (session keeps running)
+    /codex kill [name]    — kill a session by name (or current if no name)
+    /codex kill all      — kill all Codex sessions
+    /codex list          — list alive Codex tmux sessions
+    /codex resume <name> — resume an existing Codex tmux session
+    """
+    msg = ctx.msg
+    session = ctx.session or ctx.loop.sessions.get_or_create(ctx.key)
+    args = (ctx.args or "").strip()
+    meta = dict(msg.metadata or {})
+
+    sub = args.split()[0].lower() if args else ""
+
+    if sub == "exit":
+        return await _codex_exit(msg, session, ctx.loop, meta)
+    if sub == "kill":
+        kill_target = args.split()[1] if len(args.split()) > 1 else ""
+        return await _codex_kill(msg, session, ctx.loop, kill_target, meta)
+    if sub == "list":
+        return await _codex_list(msg, meta)
+    if sub == "resume":
+        name = args.split()[1] if len(args.split()) > 1 else ""
+        return await _codex_resume(msg, session, ctx.loop, name, meta)
+
+    # /codex or /codex start [path]
+    workspace_arg = ""
+    if sub == "start":
+        workspace_arg = args[len("start"):].strip()
+    elif sub and sub != "start":
+        # /codex <something unknown> — treat as /codex start with that path
+        workspace_arg = args
+
+    return await _codex_start(msg, session, ctx.loop, workspace_arg, meta)
+
+
+async def _codex_start(msg, session, loop, workspace_arg: str, meta: dict) -> OutboundMessage:
+    if session.metadata.get("codex_proxy"):
+        proxy = CodexProxy.from_dict(session.metadata["codex_proxy"])
+        if await proxy.is_alive():
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Codex mode is already active (session: `{proxy.tmux_session}`). "
+                        f"Use `/codex exit` to leave first.",
+                metadata=meta,
+            )
+        # Dead session — clean up metadata.
+        session.metadata.pop("codex_proxy", None)
+
+    workspace = workspace_arg or str(loop.workspace)
+
+    # Notify the user that startup may take a moment.
+    progress_meta = {**meta, "_progress": True}
+    await loop.bus.publish_outbound(OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Starting Codex in `{workspace}`...",
+        metadata=progress_meta,
+    ))
+
+    try:
+        proxy = await CodexProxy.start(workspace=workspace)
+    except Exception as e:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Failed to start Codex: {e}",
+            metadata=meta,
+        )
+
+    session.metadata["codex_proxy"] = proxy.to_dict()
+    loop.sessions.save(session)
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Codex mode activated.\n"
+                f"- Session: `{proxy.tmux_session}`\n"
+                f"- Workspace: `{workspace}`\n\n"
+                f"All your messages will now be sent to Codex. "
+                f"Use `/codex exit` to detach (keeps running) or `/codex kill` to terminate.",
+        metadata=meta,
+    )
+
+
+async def cmd_codex_exit_priority(ctx: CommandContext) -> OutboundMessage:
+    """Priority /codex exit — cancels any blocked codex passthrough and detaches immediately."""
+    loop = ctx.loop
+    msg = ctx.msg
+    meta = dict(msg.metadata or {})
+
+    # Cancel active session tasks to unblock the session lock (same as /stop).
+    tasks = list(loop._active_tasks.get(msg.session_key, []))
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    if tasks:
+        await asyncio.wait(tasks, timeout=2.0)
+
+    # Access the session directly (lock is now free after cancellation).
+    session = loop.sessions.get_or_create(msg.session_key)
+    proxy_data = session.metadata.pop("codex_proxy", None)
+    loop.sessions.save(session)
+
+    if not proxy_data:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Not in Codex mode.", metadata=meta,
+        )
+
+    proxy = CodexProxy.from_dict(proxy_data)
+
+    # Start background watcher if session is still alive.
+    watcher_note = ""
+    if await proxy.is_alive():
+        if existing := loop._codex_watchers.pop(proxy.tmux_session, None):
+            existing.cancel()
+        task = asyncio.create_task(
+            watch_until_idle(proxy, loop.bus, msg.channel, msg.chat_id)
+        )
+        loop._codex_watchers[proxy.tmux_session] = task
+        loop._background_tasks.append(task)
+        watcher_note = "\nwill be notified when it's done."
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=(
+            f"Detached from Codex session `{proxy.tmux_session}`（still running）。"
+            f"{watcher_note}\n"
+            f"use `/codex resume {proxy.tmux_session}` to continue。"
+        ),
+        metadata=meta,
+    )
+
+
+async def _codex_exit(msg, session, loop, meta: dict) -> OutboundMessage:
+    """Detach from Codex mode — session keeps running in the background."""
+    proxy_data = session.metadata.pop("codex_proxy", None)
+    if not proxy_data:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Not in Codex mode.", metadata=meta,
+        )
+
+    proxy = CodexProxy.from_dict(proxy_data)
+    loop.sessions.save(session)
+
+    # If Codex is still running, start a background watcher that notifies when done.
+    watcher_note = ""
+    if await proxy.is_alive():
+        # Cancel any existing watcher for this session (shouldn't happen, but be safe).
+        if existing := loop._codex_watchers.pop(proxy.tmux_session, None):
+            existing.cancel()
+
+        import asyncio
+        task = asyncio.create_task(
+            watch_until_idle(proxy, loop.bus, msg.channel, msg.chat_id)
+        )
+        loop._codex_watchers[proxy.tmux_session] = task
+        loop._background_tasks.append(task)
+        watcher_note = "\nwill be notified when it's done."
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=(
+            f"Detached from Codex session `{proxy.tmux_session}`（still running）。"
+            f"{watcher_note}\n"
+            f"use `/codex resume {proxy.tmux_session}` to continue。"
+        ),
+        metadata=meta,
+    )
+
+
+async def _codex_kill(msg, session, loop, target: str, meta: dict) -> OutboundMessage:
+    """Kill a Codex session by name, or all sessions, or the currently attached one."""
+    from nanobot.agent.codex_proxy import _get_socket_dir
+
+    socket = os.path.join(_get_socket_dir(), "nanobot.sock")
+
+    async def _kill_proxy(proxy: CodexProxy, sess_key: str | None = None) -> None:
+        """Kill a proxy and cancel its watcher. Detaches session if attached."""
+        if existing := loop._codex_watchers.pop(proxy.tmux_session, None):
+            existing.cancel()
+        if await proxy.is_alive():
+            await proxy.kill()
+        if sess_key:
+            s = loop.sessions.get_or_create(sess_key)
+            if s.metadata.get("codex_proxy", {}).get("tmux_session") == proxy.tmux_session:
+                s.metadata.pop("codex_proxy", None)
+                loop.sessions.save(s)
+
+    if target == "all":
+        sessions = await CodexProxy.list_sessions()
+        if not sessions:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No active Codex sessions.", metadata=meta,
+            )
+        for s in sessions:
+            proxy = CodexProxy(socket=socket, tmux_session=s["name"], workspace="")
+            await _kill_proxy(proxy)
+        # Also clear current session's codex_proxy if any.
+        session.metadata.pop("codex_proxy", None)
+        loop.sessions.save(session)
+        names = ", ".join(f"`{s['name']}`" for s in sessions)
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Terminated {len(sessions)} Codex session(s): {names}.",
+            metadata=meta,
+        )
+
+    if target:
+        # Kill by explicit name.
+        proxy = CodexProxy(socket=socket, tmux_session=target, workspace="")
+        if not await proxy.is_alive():
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Session `{target}` not found. Use `/codex list` to see running sessions.",
+                metadata=meta,
+            )
+        await _kill_proxy(proxy, sess_key=msg.session_key)
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Codex session `{target}` terminated.",
+            metadata=meta,
+        )
+
+    # No target — kill the currently attached session.
+    proxy_data = session.metadata.pop("codex_proxy", None)
+    if not proxy_data:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Not in Codex mode and no session name given.\n"
+                    "Usage: `/codex kill <name>` or `/codex kill all`",
+            metadata=meta,
+        )
+
+    proxy = CodexProxy.from_dict(proxy_data)
+    await _kill_proxy(proxy)
+    loop.sessions.save(session)
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Codex session `{proxy.tmux_session}` terminated.",
+        metadata=meta,
+    )
+
+
+async def _codex_list(msg, meta: dict) -> OutboundMessage:
+    sessions = await CodexProxy.list_sessions()
+    if not sessions:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="No active Codex sessions.", metadata=meta,
+        )
+    lines = ["Active Codex sessions:"]
+    for s in sessions:
+        lines.append(f"- `{s['name']}` (created: {s['created']})")
+    lines.append("\nUse `/codex resume <name>` to resume one.")
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content="\n".join(lines), metadata=meta,
+    )
+
+
+async def _codex_resume(msg, session, loop, name: str, meta: dict) -> OutboundMessage:
+    if not name:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Usage: `/codex resume <session-name>`\n"
+                    "Use `/codex list` to see available sessions.",
+            metadata=meta,
+        )
+
+    if session.metadata.get("codex_proxy"):
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="Already in Codex mode. Use `/codex exit` to detach first.",
+            metadata=meta,
+        )
+
+    # Verify the session exists.
+    sessions = await CodexProxy.list_sessions()
+    match = next((s for s in sessions if s["name"] == name), None)
+    if not match:
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"Session `{name}` not found. Use `/codex list` to see available sessions.",
+            metadata=meta,
+        )
+
+    from nanobot.agent.codex_proxy import _get_socket_dir
+    import os
+    socket = os.path.join(_get_socket_dir(), "nanobot.sock")
+    proxy = CodexProxy(socket=socket, tmux_session=name, workspace=str(loop.workspace))
+    session.metadata["codex_proxy"] = proxy.to_dict()
+    loop.sessions.save(session)
+
+    # Cancel any background watcher for this session.
+    if watcher := loop._codex_watchers.pop(name, None):
+        watcher.cancel()
+
+    return OutboundMessage(
+        channel=msg.channel, chat_id=msg.chat_id,
+        content=f"Resumed Codex session `{name}`. All messages will be sent to Codex.\n"
+                f"Use `/codex exit` to detach or `/codex kill` to terminate.",
+        metadata=meta,
+    )
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = [
@@ -321,6 +636,12 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/codex — Enter Codex CLI proxy mode",
+        "/codex exit — Detach from Codex (session keeps running)",
+        "/codex kill [name] — Kill a session by name (or current if attached)",
+        "/codex kill all — Kill all active Codex sessions",
+        "/codex list — List active Codex sessions",
+        "/codex resume <name> — Resume a Codex session",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -334,6 +655,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/stop", cmd_stop)
     router.priority("/restart", cmd_restart)
     router.priority("/status", cmd_status)
+    router.priority("/codex exit", cmd_codex_exit_priority)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
     router.exact("/dream", cmd_dream)
@@ -342,3 +664,5 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.exact("/dream-restore", cmd_dream_restore)
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/help", cmd_help)
+    router.exact("/codex", cmd_codex)
+    router.prefix("/codex ", cmd_codex)

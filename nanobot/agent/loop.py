@@ -202,6 +202,8 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._background_tasks: list[asyncio.Task] = []
         self._session_locks: dict[str, asyncio.Lock] = {}
+        # Codex watcher tasks keyed by tmux session name — cancelled on resume.
+        self._codex_watchers: dict[str, asyncio.Task] = {}
         # NANOBOT_MAX_CONCURRENT_REQUESTS: <=0 means unlimited; default 3.
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -530,6 +532,10 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
+        # Codex passthrough mode — bypass the LLM pipeline entirely.
+        if session.metadata.get("codex_proxy"):
+            return await self._handle_codex_passthrough(msg, session)
+
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
@@ -583,6 +589,42 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=meta,
+        )
+
+    async def _handle_codex_passthrough(
+        self,
+        msg: InboundMessage,
+        session: Session,
+    ) -> OutboundMessage:
+        """Forward a user message to the active Codex CLI session."""
+        from nanobot.agent.codex_proxy import CodexProxy
+
+        proxy_data = session.metadata.get("codex_proxy")
+        proxy = CodexProxy.from_dict(proxy_data)
+
+        # Check if the tmux session is still alive.
+        if not await proxy.is_alive():
+            session.metadata.pop("codex_proxy", None)
+            self.sessions.save(session)
+            logger.warning("Codex session {} died, exiting codex mode", proxy.tmux_session)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Codex session has ended unexpectedly. Returning to normal mode.",
+            )
+
+        # Relay the message to Codex.
+        try:
+            response = await proxy.send(msg.content)
+        except Exception as e:
+            logger.error("Codex proxy send failed: {}", e)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Error communicating with Codex: {e}",
+            )
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id, content=response,
+            metadata=dict(msg.metadata or {}),
         )
 
     def _sanitize_persisted_blocks(
