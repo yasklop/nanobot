@@ -323,7 +323,6 @@ async def cmd_codex(ctx: CommandContext) -> OutboundMessage:
 
     /codex               — start Codex mode (workspace = bot workspace)
     /codex start [path]  — start with explicit workspace
-    /codex run <prompt>  — run a one-shot task in background, notify when done
     /codex exit          — detach from Codex mode (session keeps running)
     /codex kill [name]    — kill a session by name (or current if no name)
     /codex kill all      — kill all Codex sessions
@@ -351,9 +350,6 @@ async def cmd_codex(ctx: CommandContext) -> OutboundMessage:
     if sub == "peek":
         name = args.split()[1] if len(args.split()) > 1 else ""
         return await _codex_peek(msg, session, name, meta)
-    if sub == "run":
-        prompt = args[len("run"):].strip()
-        return await _codex_run(msg, session, ctx.loop, prompt, meta)
 
     # /codex or /codex start [path]
     workspace_arg = ""
@@ -408,59 +404,6 @@ async def _codex_start(msg, session, loop, workspace_arg: str, meta: dict) -> Ou
                 f"- Workspace: `{workspace}`\n\n"
                 f"All your messages will now be sent to Codex. "
                 f"Use `/codex exit` to detach (keeps running) or `/codex kill` to terminate.",
-        metadata=meta,
-    )
-
-
-async def _codex_run(msg, session, loop, prompt: str, meta: dict) -> OutboundMessage:
-    """Start Codex, send a one-shot prompt, and detach with a background watcher."""
-    if not prompt:
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content="Usage: `/codex run <prompt>`",
-            metadata=meta,
-        )
-
-    workspace = str(loop.workspace)
-
-    progress_meta = {**meta, "_progress": True}
-    await loop.bus.publish_outbound(OutboundMessage(
-        channel=msg.channel, chat_id=msg.chat_id,
-        content=f"Starting Codex in `{workspace}`...",
-        metadata=progress_meta,
-    ))
-
-    try:
-        proxy = await CodexProxy.start(workspace=workspace)
-    except Exception as e:
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content=f"Failed to start Codex: {e}",
-            metadata=meta,
-        )
-
-    # Fire-and-forget: send prompt without waiting for response.
-    await proxy.send_nowait(prompt)
-
-    # Brief pause so codex starts processing before the watcher checks.
-    await asyncio.sleep(1)
-
-    # Start background watcher — will notify when codex finishes.
-    task = asyncio.create_task(
-        watch_until_idle(proxy, loop.bus, msg.channel, msg.chat_id)
-    )
-    loop._codex_watchers[proxy.tmux_session] = task
-    loop._background_tasks.append(task)
-
-    return OutboundMessage(
-        channel=msg.channel, chat_id=msg.chat_id,
-        content=(
-            f"Codex task started.\n"
-            f"- Session: `{proxy.tmux_session}`\n"
-            f"- Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}\n\n"
-            f"Will notify when done. "
-            f"Use `/codex resume {proxy.tmux_session}` to check progress."
-        ),
         metadata=meta,
     )
 
@@ -736,12 +679,11 @@ def build_help_text() -> str:
         "/restart — Restart the bot",
         "/status — Show bot status",
         "/codex — Enter Codex CLI proxy mode",
-        "/codex run <prompt> — Run a one-shot task in background",
         "/codex exit — Detach from Codex (session keeps running)",
-        "/codex kill [name] — Kill a session by name (or current if attached)",
+        "/codex kill <name> — Kill a session by name (or current if attached)",
         "/codex kill all — Kill all active Codex sessions",
         "/codex list — List active Codex sessions",
-        "/codex peek [name] — Snapshot a session without entering it",
+        "/codex peek <name> — Snapshot a session without entering it",
         "/codex resume <name> — Resume a Codex session",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",

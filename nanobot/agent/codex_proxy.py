@@ -79,8 +79,13 @@ class CodexProxy:
         cls,
         workspace: str,
         initial_prompt: str | None = None,
+        codex_args: str = "",
     ) -> CodexProxy:
-        """Spawn a tmux session running ``codex`` in interactive mode."""
+        """Spawn a tmux session running ``codex`` in interactive mode.
+
+        *codex_args* are appended to the ``codex`` command (e.g. ``"-a never"``).
+        Existing callers that pass no extra args are unaffected.
+        """
         socket_dir = _get_socket_dir()
         os.makedirs(socket_dir, exist_ok=True)
         socket = os.path.join(socket_dir, "nanobot.sock")
@@ -96,8 +101,9 @@ class CodexProxy:
             raise RuntimeError(f"Failed to create tmux session: {out}")
 
         # Launch codex inside the session.
+        cmd = f"codex {codex_args}".strip() if codex_args else "codex"
         rc, out = await _run(
-            f'tmux -S {_q(socket)} send-keys -t {_q(name)} "codex" Enter'
+            f'tmux -S {_q(socket)} send-keys -t {_q(name)} {_q(cmd)} Enter'
         )
         if rc != 0:
             raise RuntimeError(f"Failed to start codex: {out}")
